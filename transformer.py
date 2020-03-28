@@ -1,9 +1,33 @@
 import tensorflow_datasets as tfds
 import tensorflow as tf
 
-import time
+import time, argparse, os, shutil
 import numpy as np
 import matplotlib.pyplot as plt
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-gpu', type=str, default="0") # gpu to be used
+    parser.add_argument('-path', type=str, default="./") # path to dataset and checkpoints
+    parser.add_argument('-epochs', type=int, default="20") # path to dataset and checkpoints
+    args = parser.parse_args()
+
+    return args
+
+args = parse_args()
+os.environ["CUDA_VISIBLE_DEVICES"]= args.gpu
+BUFFER_SIZE = 20000
+MAX_LENGTH = 40
+EPOCHS = args.epochs
+BATCH_SIZE = 64
+
+
+if os.path.exists(args.path + 'logs/'):
+  shutil.rmtree(args.path + 'logs/')
+
+train_writer = tf.summary.create_file_writer(args.path + "logs/")
+
 
 """## Setup input pipeline
 
@@ -12,18 +36,13 @@ Use [TFDS](https://www.tensorflow.org/datasets) to load the [Portugese-English t
 This dataset contains approximately 50000 training examples, 1100 validation examples, and 2000 test examples.
 """
 
-examples, metadata = tfds.load('ted_hrlr_translate/pt_to_en', with_info=True, as_supervised=True)
+examples, metadata = tfds.load('ted_hrlr_translate/pt_to_en', with_info=True, as_supervised=True, data_dir= args.path)
 train_examples, val_examples = examples['train'], examples['validation']
 
 """Create a custom subwords tokenizer from the training dataset."""
 
 tokenizer_en = tfds.features.text.SubwordTextEncoder.build_from_corpus((en.numpy() for pt, en in train_examples), target_vocab_size=2**13)
 tokenizer_pt = tfds.features.text.SubwordTextEncoder.build_from_corpus((pt.numpy() for pt, en in train_examples), target_vocab_size=2**13)
-
-
-BUFFER_SIZE = 20000
-BATCH_SIZE = 64
-MAX_LENGTH = 40
 
 """Add a start and end token to the input and target."""
 
@@ -45,8 +64,11 @@ def filter_max_length(x, y, max_length=MAX_LENGTH):
   return tf.logical_and(tf.size(x) <= max_length,
                         tf.size(y) <= max_length)
 
-train_preprocessed = (train_examples.map(tf_encode).filter(filter_max_length).cache().shuffle(BUFFER_SIZE))
-val_preprocessed = (val_examples.map(tf_encode).filter(filter_max_length))
+# train_preprocessed = (train_examples.map(tf_encode).filter(filter_max_length).cache().shuffle(BUFFER_SIZE))
+# val_preprocessed = (val_examples.map(tf_encode).filter(filter_max_length))
+
+train_preprocessed = (train_examples.map(tf_encode).cache().shuffle(BUFFER_SIZE))
+val_preprocessed = (val_examples.map(tf_encode))
 
 """Pad and batch examples together:"""
 
@@ -58,10 +80,10 @@ pt_batch, en_batch = next(iter(val_dataset))
 
 # Positional encoding
 def positional_encoding(position, d_model):
-	
-	pos = np.arange(position)[:, np.newaxis]
-	i = np.arange(d_model)[np.newaxis, :]
-	angle_rates = 1 / np.power(10000, (2 * (i//2)) / np.float32(d_model))
+    
+  pos = np.arange(position)[:, np.newaxis]
+  i = np.arange(d_model)[np.newaxis, :]
+  angle_rates = 1 / np.power(10000, (2 * (i//2)) / np.float32(d_model))
   angle_rads = pos * angle_rates
   
   # apply sin to even indices in the array; 2i
@@ -313,6 +335,7 @@ class Transformer(tf.keras.Model):
 num_layers = 4
 d_model = 128
 dff = 512
+
 num_heads = 8
 
 input_vocab_size = tokenizer_pt.vocab_size + 2
@@ -381,7 +404,7 @@ def create_masks(inp, tar):
 
 """Create the checkpoint path and the checkpoint manager. This will be used to save checkpoints every `n` epochs."""
 
-checkpoint_path = "./checkpoints/train"
+checkpoint_path = args.path + "checkpoints/train"
 ckpt = tf.train.Checkpoint(transformer=transformer, optimizer=optimizer)
 ckpt_manager = tf.train.CheckpointManager(ckpt, checkpoint_path, max_to_keep=5)
 
@@ -390,24 +413,8 @@ if ckpt_manager.latest_checkpoint:
   ckpt.restore(ckpt_manager.latest_checkpoint)
   print ('Latest checkpoint restored!!')
 
-"""The target is divided into tar_inp and tar_real. tar_inp is passed as an input to the decoder. `tar_real` is that same input shifted by 1: At each location in `tar_input`, `tar_real` contains the  next token that should be predicted.
 
-For example, `sentence` = "SOS A lion in the jungle is sleeping EOS"
 
-`tar_inp` =  "SOS A lion in the jungle is sleeping"
-
-`tar_real` = "A lion in the jungle is sleeping EOS"
-
-The transformer is an auto-regressive model: it makes predictions one part at a time, and uses its output so far to decide what to do next. 
-
-During training this example uses teacher-forcing (like in the [text generation tutorial](./text_generation.ipynb)). Teacher forcing is passing the true output to the next time step regardless of what the model predicts at the current time step.
-
-As the transformer predicts each word, *self-attention* allows it to look at the previous words in the input sequence to better predict the next word.
-
-To prevent the model from peaking at the expected output the model uses a look-ahead mask.
-"""
-
-EPOCHS = 20
 
 # The @tf.function trace-compiles train_step into a TF graph for faster
 # execution. The function specializes to the precise shape of the argument
@@ -438,26 +445,6 @@ def train_step(inp, tar):
   train_accuracy(tar_real, predictions)
 
 """Portuguese is used as the input language and English is the target language."""
-
-for epoch in range(EPOCHS):
-  start = time.time()
-  
-  train_loss.reset_states()
-  train_accuracy.reset_states()
-  
-  for (batch, (inp, tar)) in enumerate(train_dataset):
-    train_step(inp, tar)
-    
-    if batch % 50 == 0:
-      print ('Epoch {} Batch {} Loss {:.4f} Accuracy {:.4f}'.format(epoch + 1, batch, train_loss.result(), train_accuracy.result()))
-      
-  if (epoch + 1) % 5 == 0:
-    ckpt_save_path = ckpt_manager.save()
-    print ('Saving checkpoint for epoch {} at {}'.format(epoch+1, ckpt_save_path))
-    
-  print ('Epoch {} Loss {:.4f} Accuracy {:.4f}'.format(epoch + 1, train_loss.result(), train_accuracy.result()))
-  print ('Time taken for 1 epoch: {} secs\n'.format(time.time() - start))
-
 def evaluate(inp_sentence):
   start_token = [tokenizer_pt.vocab_size]
   end_token = [tokenizer_pt.vocab_size + 1]
@@ -531,20 +518,60 @@ def translate(sentence, plot=''):
   predicted_sentence = tokenizer_en.decode([i for i in result 
                                             if i < tokenizer_en.vocab_size])  
 
-  print('Input: {}'.format(sentence))
-  print('Predicted translation: {}'.format(predicted_sentence))
+  # print('Input: {}'.format(sentence))
+  # print('Predicted translation: {}'.format(predicted_sentence))
   
   if plot:
     plot_attention_weights(attention_weights, sentence, result, plot)
 
-translate("este é um problema que temos que resolver.")
-print ("Real translation: this is a problem we have to solve .")
+  return predicted_sentence
 
-translate("os meus vizinhos ouviram sobre esta ideia.")
-print ("Real translation: and my neighboring homes heard about this idea .")
 
-translate("vou então muito rapidamente partilhar convosco algumas histórias de algumas coisas mágicas que aconteceram.")
-print ("Real translation: so i 'll just share with you some stories very quickly of some magical things that have happened .")
+# Training loop
+
+sentence_1_en = "so i 'll just share with you some stories very quickly of some magical things that have happened ."
+sentence_2_en = "this is a problem we have to solve ."
+sentence_3_en = "and my neighboring homes heard about this idea ."
+
+sentence_1_pt = "vou então muito rapidamente partilhar convosco algumas histórias de algumas coisas mágicas que aconteceram."
+sentence_2_pt = "este é um problema que temos que resolver."
+sentence_3_pt = "os meus vizinhos ouviram sobre esta ideia."
+
+counter = 0
+
+for epoch in range(EPOCHS):
+  start = time.time()
+  
+  train_loss.reset_states()
+  train_accuracy.reset_states()
+  
+  for (batch, (inp, tar)) in enumerate(train_dataset):
+    counter += len(inp)
+    train_step(inp, tar)
+
+    if batch % 50 == 0:
+      # print ('Epoch {} Batch {} Loss {:.4f} Accuracy {:.4f}'.format(epoch + 1, batch, train_loss.result(), train_accuracy.result()))
+      
+      # translate("vou então muito rapidamente partilhar convosco algumas histórias de algumas coisas mágicas que aconteceram.")
+      # print ("Real translation: so i 'll just share with you some stories very quickly of some magical things that have happened .\n")
+
+      with train_writer.as_default():
+        tf.summary.scalar("Train Loss", train_loss.result(), step = counter)
+        tf.summary.scalar("Train Accuracy", train_accuracy.result(), step = counter)
+        tf.summary.text(sentence_1_en, translate(sentence_1_pt), step = counter)
+        tf.summary.text(sentence_2_en, translate(sentence_2_pt), step = counter)
+        tf.summary.text(sentence_3_en, translate(sentence_3_pt), step = counter)
+        train_writer.flush()
+      
+  if (epoch + 1) % 5 == 0:
+    ckpt_save_path = ckpt_manager.save()
+    print ('Saving checkpoint for epoch {} at {}'.format(epoch+1, ckpt_save_path))
+    
+  print ('Epoch {} Loss {:.4f} Accuracy {:.4f}'.format(epoch + 1, train_loss.result(), train_accuracy.result()))
+  print ('Time taken for 1 epoch: {} secs\n'.format(time.time() - start))
+
+
+train_writer.close()
 
 # """You can pass different layers and attention blocks of the decoder to the `plot` parameter."""
 
